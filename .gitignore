@@ -1,0 +1,15 @@
+# 네이버 로그인 쿠키 — 절대 커밋 금지
+data/.auth/
+*naver_state.json
+
+# 수집 원문·중간 산출물 (타인 카페 글). 로컬에만 둔다.
+data/
+output/
+
+# 파이썬
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
