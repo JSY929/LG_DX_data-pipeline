@@ -20,6 +20,8 @@ from urllib.parse import quote_plus
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from collect import ROOT, RAW, clean, hid   # 가명화·정제 재사용
 
+CAFE_NAME = "맘스홀릭 베이비"
+CAFE_SLUG = "imsanbu"
 CLUB_ID = "10094499"
 MENU_ID = "392"           # 임신 중 질문방 (이전: 591 산후조리 질문방). --menu 로 덮어쓰기 가능
 STATE = ROOT / "data" / ".auth" / "naver_state.json"
@@ -39,6 +41,7 @@ HDRS = {"referer": f"https://cafe.naver.com/f-e/cafes/{CLUB_ID}/menus/{MENU_ID}"
         "x-cafe-product": "pc"}
 
 PER_PAGE = 15             # 검색창 기본값. 올리면 거부될 수 있음.
+YEARS = 10                # 최근 N년만 수집. 그보다 오래된 글은 저장하지 않는다.
 PAGE_CAP = 100            # 네이버 카페 검색 상한. 키워드당 100페이지(=1500건)에서 잘린다.
                           # 여기 걸리면 결과가 소진된 게 아니라 "잘린" 것이고, 잘려나가는 쪽은
                           # 오래된 글이라 연도 분포가 최신 쪽으로 왜곡된다. 해법은 두 가지:
@@ -82,6 +85,15 @@ def pick_body(data):
     return ""
 
 
+def pick_comments(data):
+    """본문 응답 안의 댓글 내용. 별도 요청 없이 article API 에 같이 온다."""
+    for d in walk(data or {}):
+        items = d.get("items")
+        if isinstance(items, list) and items and isinstance(items[0], dict) and "content" in items[0]:
+            return [to_text(x.get("content")) for x in items if x.get("content")]
+    return []
+
+
 def pick_board(data):
     """본문 응답 안의 게시판 이름 (menu 객체의 name)."""
     for d in walk(data or {}):
@@ -102,23 +114,25 @@ def to_text(html_str):
     return clean(BR.sub("\n", html_str or ""))
 
 
-def record(query, art, body):
-    """가명화 레코드 — 닉네임·원본 URL 은 저장하지 않는다."""
-    w = art.get("writerInfo") or art.get("writer") or {}
-    nick = w.get("nickName") or w.get("nickname") or art.get("writerNickname") or ""
+def record(query, art, body=None):
+    """수집 레코드. 작성자 닉네임은 저장하지 않는다(가명화 유지)."""
+    aid = art.get("articleId") or art.get("articleid")
+    comments = pick_comments(body) if body else []
     return {
-        "source": f"cafe_{CLUB_ID}_{MENU_ID}",
-        "query": query,
-        "doc_id": hid(f"{CLUB_ID}/{art.get('articleId') or art.get('articleid')}"),
-        "author": hid(nick) if nick else "",
-        "board": clean(art.get("menuName") or art.get("boardName") or ""),
+        "cafe_name": CAFE_NAME,
+        "club_id": CLUB_ID,
         "menu_id": str(art.get("menuId") or MENU_ID),
+        "board": clean(pick_board(body)) if body else "",
+        "keyword": query,
         "postdate": when(art),
         "title": clean(art.get("subject") or art.get("title")),
-        "summary": clean(art.get("summary")),          # 검색 스니펫 — 본문 없이도 필터 가능
-        "hits": art.get("highlightKeywords") or [],    # 실제로 매칭된 단어
-        "text": to_text(body),
-        "comments": art.get("commentCount", art.get("replyCount", 0)),
+        "text": to_text(pick_body(body)) if body else "",
+        "comments_text": comments,
+        "comment_count": art.get("commentCount", art.get("replyCount", 0)),
+        "url": f"https://cafe.naver.com/{CAFE_SLUG}/{aid}",
+        "doc_id": hid(f"{CLUB_ID}/{aid}"),             # 중복 제거용
+        "summary": clean(art.get("summary")),
+        "hits": art.get("highlightKeywords") or [],
         "reads": art.get("readCount", 0),
     }
 
@@ -242,7 +256,7 @@ def count_only(queries):
     print(f"\n합계 {tot}건 (중복 제거 전). 실제는 30~40% 줄어든다.")
 
 
-def crawl(queries, tag, pages, limit=None, want_body=True):
+def crawl(queries, tag, pages, limit=None, want_body=True, max_hours=None):
     from playwright.sync_api import sync_playwright
     if not STATE.exists():
         sys.exit("로그인 쿠키 없음. 먼저: python src/cafe_crawl.py --login")
@@ -252,11 +266,15 @@ def crawl(queries, tag, pages, limit=None, want_body=True):
     ckpt = RAW / f"_ckpt_cafe_{tag}.txt"
     done = set(ckpt.read_text(encoding="utf-8").splitlines()) if ckpt.exists() else set()
     seen = {json.loads(l)["doc_id"] for l in out.open(encoding="utf-8")} if out.exists() else set()
-    n, t0, fail = 0, time.time(), 0
+    n, t0, fail, old = 0, time.time(), 0, 0
+    cutoff = str(int(time.strftime("%Y")) - YEARS)      # 예: 2016
     stat = {}                 # 키워드별 (요청페이지, 저장건수) — 끝에 잘림 여부 보고
 
     def nap():
         time.sleep(SLEEP + random.random())
+
+    def over_time():
+        return max_hours and (time.time() - t0) / 3600 >= max_hours
 
     with sync_playwright() as p, out.open("a", encoding="utf-8") as f, ckpt.open("a", encoding="utf-8") as ck:
         rq = ctx(p)
@@ -273,34 +291,36 @@ def crawl(queries, tag, pages, limit=None, want_body=True):
                     break                       # 결과 끝 또는 실패 — 다음 키워드로
                 st[0] = pg
                 for a in arts:
-                    if limit and n >= limit:
+                    if (limit and n >= limit) or over_time():
                         break
                     aid = a.get("articleId") or a.get("articleid")
-                    r0 = record(q, a, "")
-                    if r0["doc_id"] in seen:
+                    if hid(f"{CLUB_ID}/{aid}") in seen:
                         continue
-                    seen.add(r0["doc_id"])
+                    if when(a)[:4] and when(a)[:4] < cutoff:   # 최근 YEARS 년만
+                        old += 1
+                        continue
+                    seen.add(hid(f"{CLUB_ID}/{aid}"))
+                    body = None
                     if want_body:               # 본문 1건당 요청 1회 = 전체 시간의 대부분
                         nap()
                         body = get(rq, ARTICLE_API.format(club=CLUB_ID, aid=aid), f"본문 {aid}")
                         if body:
                             fail = 0
-                            r0["text"] = to_text(pick_body(body))
-                            r0["board"] = clean(pick_board(body))
                         else:
                             fail += 1
                             if fail >= 5:
                                 sys.exit("본문 요청 5회 연속 실패 — 중단. --check 로 확인할 것")
-                    f.write(json.dumps(r0, ensure_ascii=False) + "\n")
+                    f.write(json.dumps(record(q, a, body), ensure_ascii=False) + "\n")
                     n += 1; st[1] += 1
                 f.flush()
                 ck.write(key + "\n"); ck.flush()
                 print(f"  {key} → 누적 {n} ({(time.time()-t0)/60:.1f}분)", file=sys.stderr)
-                if limit and n >= limit:
+                if (limit and n >= limit) or over_time():
                     break
                 nap()
-            if limit and n >= limit:
-                print(f"목표 {limit}건 도달 — 중단", file=sys.stderr)
+            if (limit and n >= limit) or over_time():
+                why = f"목표 {limit}건 도달" if (limit and n >= limit) else f"제한 시간 {max_hours}h 도달"
+                print(f"{why} — 중단", file=sys.stderr)
                 break
         rq.dispose()
 
@@ -324,7 +344,8 @@ def crawl(queries, tag, pages, limit=None, want_body=True):
             print(f"{q:<14}{'-':>7}{'-':>7}  미실행", file=sys.stderr)
     req = sum(pg for pg, _ in stat.values()) * PER_PAGE
     if req:
-        print(f"\n요청 {req}건 → 저장 {n}건 (중복 제거 {100 - n*100//req}%)", file=sys.stderr)
+        print(f"\n요청 {req}건 → 저장 {n}건 (중복 제거 {100 - n*100//req}%)"
+              f"{f' · {YEARS}년 초과 제외 {old}건' if old else ''}", file=sys.stderr)
     if cut:
         print(f"\n⚠ {len(cut)}개 키워드가 {PAGE_CAP}페이지 상한에 잘렸다: {', '.join(cut)}", file=sys.stderr)
         print("  → 소진이 아니라 잘린 것. 오래된 글이 빠져 연도 분포가 왜곡된다.", file=sys.stderr)
@@ -344,14 +365,23 @@ def demo():
         {"articleId": 123, "subject": "중복글"}, {"noise": True}]}}
     arts = pick_articles(fake)
     assert len(arts) == 1, arts
-    r = record("젖병 소독", arts[0],
-               "소독기 vs <b>열탕</b><br>어느 쪽이 나을까요 &amp; 시간은요")
+    fake_body = {"result": {
+        "article": {"contentHtml": "소독기 vs <b>열탕</b><br>어느 쪽이 나을까요 &amp; 시간은요"},
+        "menu": {"name": "임신 중 질문방", "menuType": "B"},
+        "comments": {"items": [{"content": "저는 열탕 했어요", "writer": {"nick": "맘맘"}},
+                               {"content": "소독기 추천!"}]}}}
+    r = record("젖병 소독", arts[0], fake_body)
     assert r["text"] == "소독기 vs 열탕\n어느 쪽이 나을까요 & 시간은요", repr(r["text"])
     assert r["title"] == "젖병 소독 어떻게"
-    assert r["author"] == hid("맘맘") and "맘맘" not in json.dumps(r, ensure_ascii=False)
-    assert r["doc_id"] == hid(f"{CLUB_ID}/123") and r["comments"] == 7
+    assert r["comments_text"] == ["저는 열탕 했어요", "소독기 추천!"], r["comments_text"]
+    assert r["board"] == "임신 중 질문방"
+    assert r["url"] == f"https://cafe.naver.com/{CAFE_SLUG}/123"
+    assert r["cafe_name"] == CAFE_NAME and r["club_id"] == CLUB_ID and r["menu_id"] == "591"
+    assert "맘맘" not in json.dumps(r, ensure_ascii=False)     # 닉네임 미저장
+    assert r["comment_count"] == 7 and r["keyword"] == "젖병 소독"
+    assert record("q", arts[0])["text"] == "" and record("q", arts[0])["comments_text"] == []
     assert pick_body({"a": "짧음"}) == ""
-    assert r["postdate"] == "2026-08-31T13:00:59.727" and r["menu_id"] == "591"
+    assert r["postdate"] == "2026-08-31T13:00:59.727"
     assert r["summary"] == "있는 젖병&깔대기 소독해서" and r["hits"] == ["소독", "젖병"]
     assert when({"writeDate": 1788148859727}).startswith("2026-"), when({"writeDate": 1788148859727})
     assert pick_board({"menu": {"name": "산후조리 질문방", "menuType": "B"}}) == "산후조리 질문방"
@@ -382,6 +412,7 @@ if __name__ == "__main__":
         i = argv.index("--dump")
         dump(argv[i + 1] if len(argv) > i + 1 and not argv[i + 1].startswith("--") else "젖병 소독")
         sys.exit()
+    max_hours = float(argv[argv.index("--max-hours") + 1]) if "--max-hours" in argv else None
     limit = int(argv[argv.index("--limit") + 1]) if "--limit" in argv else None
     pages = (int(argv[argv.index("--pages") + 1]) if "--pages" in argv
              else (200 if limit else PAGES))
@@ -392,4 +423,4 @@ if __name__ == "__main__":
     tag = Path(name).stem
     print(f"[{tag}] 키워드 {len(qs)} × {pages}페이지 · 상한 {limit or '없음'}"
           f"{' · 본문 생략' if '--no-body' in argv else ''} · 간격 {SLEEP}~{SLEEP+1}초", file=sys.stderr)
-    crawl(qs, tag, pages, limit=limit, want_body="--no-body" not in argv)
+    crawl(qs, tag, pages, limit=limit, want_body="--no-body" not in argv, max_hours=max_hours)
